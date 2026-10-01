@@ -1,0 +1,108 @@
+name: "StackRadar coverage"
+
+on:
+  push:
+    branches:
+      - main
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+concurrency:
+    group: ${{ github.workflow }}-${{ github.ref }}
+    cancel-in-progress: true
+
+env:
+  APP_ENV: test
+  DATABASE_URL: "mysql://root:root@127.0.0.1:3306/packagist?serverVersion=8.0"
+
+permissions:
+    contents: read
+
+jobs:
+  coverage:
+    name: "Coverage"
+
+    runs-on: ubuntu-24.04-arm
+
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240 # 2.37.2
+        with:
+          coverage: "pcov"
+          extensions: "intl, zip, apcu"
+          php-version: "8.4"
+          tools: composer
+          ini-values: apc.enable_cli=1
+
+      - name: "Start MySQL"
+        run: sudo systemctl start mysql.service
+
+      - uses: ramsey/composer-install@65e4f84970763564f46a70b8a54b90d033b3bdda # 4.0.0
+        with:
+            composer-options: "--ansi --no-interaction --no-progress --prefer-dist"
+
+      - name: Start Redis
+        uses: supercharge/redis-github-action@bc274cb7238cd63a45029db04ee48c07a72609fd # 1.8.1
+        with:
+          redis-version: 6
+
+      - name: "Setup DB"
+        run: |
+          bin/console doctrine:database:create -n
+          bin/console doctrine:schema:create -n
+
+      - name: "Run tests with coverage"
+        run: vendor/bin/phpunit --coverage-xml build/coverage-xml
+
+      - name: "Upload coverage to StackRadar"
+        env:
+          STACKRADAR_URL: https://stackradar.com
+        run: |
+          set -euo pipefail
+          work="$RUNNER_TEMP/stackradar-coverage"
+          mkdir -p "$work"
+          (cd build/coverage-xml && zip -qr "$work/coverage-xml.zip" .)
+          cd "$work"
+
+          report_sha=$(sha256sum coverage-xml.zip | cut -d' ' -f1)
+          jq -n --arg sha "$GITHUB_SHA" --arg ref "$GITHUB_REF" --arg branch "$GITHUB_REF_NAME" \
+            --arg report_sha "$report_sha" --argjson report_size "$(stat -c%s coverage-xml.zip)" \
+            '{schema_version: 1, git: {commit_sha: $sha, ref: $ref, branch: $branch, dirty: false},
+              files: [{path: "coverage-xml.zip", size_bytes: $report_size, sha256: $report_sha, ecosystem: "composer"}]}' \
+            > stackradar-manifest.json
+          zip -q bundle.zip stackradar-manifest.json coverage-xml.zip
+
+          token=$(curl -sSf -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=stackradar.com" | jq -r .value)
+
+          response=$(jq -n --arg sha "$GITHUB_SHA" --arg ref "$GITHUB_REF" --arg branch "$GITHUB_REF_NAME" \
+            --arg workspace "$GITHUB_WORKSPACE" --arg report_sha "$report_sha" \
+            --arg bundle_sha "$(sha256sum bundle.zip | cut -d' ' -f1)" --argjson bundle_size "$(stat -c%s bundle.zip)" \
+            --arg manifest_sha "$(sha256sum stackradar-manifest.json | cut -d' ' -f1)" \
+            '{schema_version: 1,
+              bundle: {format: "zip", content_type: "application/zip", size_bytes: $bundle_size, sha256: $bundle_sha},
+              manifest: {schema_version: 1, git: {commit_sha: $sha, ref: $ref, branch: $branch, dirty: false},
+                         files_count: 1, sha256: $manifest_sha},
+              coverage: {ecosystem: "composer", framework: "phpunit", format: "phpunit-xml",
+                         report_path: "coverage-xml.zip", report_sha256: $report_sha, workspace: $workspace},
+              client: {name: "stackradar-coverage-workflow", version: "1"}}' \
+            | curl -sSf -X POST "$STACKRADAR_URL/api/confidence/coverage-uploads" \
+                -H "Authorization: Bearer $token" -H "Content-Type: application/json" -H "Accept: application/json" \
+                --data @-)
+
+          upload_url=$(jq -r '.upload.url // empty' <<< "$response")
+          if [ -n "$upload_url" ]; then
+            mapfile -t headers < <(jq -r '.upload.headers // {} | to_entries[] | "\(.key): \(.value)"' <<< "$response")
+            header_args=()
+            for header in "${headers[@]}"; do header_args+=(-H "$header"); done
+            curl -sSf -X PUT "$upload_url" "${header_args[@]}" -H "Content-Type: application/zip" --data-binary @bundle.zip
+          fi
+          echo "Coverage report $(jq -r .report_id <<< "$response") submitted."
