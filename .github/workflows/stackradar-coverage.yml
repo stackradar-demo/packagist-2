@@ -26,8 +26,8 @@ jobs:
     runs-on: ubuntu-24.04-arm
 
     permissions:
-      contents: read
-      id-token: write
+      contents: read # check out the code to run the tests
+      id-token: write # request the GitHub Actions OIDC token StackRadar verifies on upload
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
