@@ -1,5 +1,6 @@
 {
     "name": "packagist.org",
+    "description": "Temporary description for a StackRadar check test.",
     "dependencies": {
         "@popperjs/core": "^2.11.8",
         "algoliasearch": "^4.24.0",
